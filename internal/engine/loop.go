@@ -51,7 +51,7 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 
 		// ================= Phase 1: Thinking =================
 		if e.EnableThinking {
-			log.Println("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
+			log.Println("[Engine][Phase 1] 不含工具挂载，强制进入慢思考与规划阶段，开始调用模型...")
 			thinkResp, err := e.provider.Generate(ctx, contextHistory, nil) // 传入 nil 剥夺工具
 			if err != nil {
 				return fmt.Errorf("Thinking 阶段生成失败: %w", err)
@@ -63,7 +63,7 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 		}
 
 		// ================= Phase 2: Action =================
-		log.Println("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
+		log.Println("[Engine][Phase 2] 含工具挂载，开始调用模型...")
 		actionResp, err := e.provider.Generate(ctx, contextHistory, availableTools)
 		if err != nil {
 			return fmt.Errorf("Action 阶段生成失败: %w", err)
@@ -77,7 +77,7 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 
 		// ================= 执行判断 =================
 		if len(actionResp.ToolCalls) == 0 {
-			log.Println("[Engine] 模型未请求调用工具，任务宣告完成。")
+			log.Println("[Engine] 模型回复中不含tool_call，任务宣告完成。")
 			break
 		}
 
