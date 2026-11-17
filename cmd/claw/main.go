@@ -26,16 +26,20 @@ func main() {
 	registry.Register(tools.NewReadFileTool(workDir))
 	registry.Register(tools.NewWriteFileTool(workDir))
 	registry.Register(tools.NewBashTool(workDir))
+	registry.Register(tools.NewEditFileTool(workDir)) // 挂载 Edit 工具
 
-	// 实例化核心引擎，关闭慢思考阶段，享受 YOLO 急速模式
+	// 开启慢思考模式
+	// 注：教学快照此处实际传入 false，为保持行为一致，Thinking 仍关闭。
 	eng := engine.NewAgentEngine(llmProvider, registry, workDir, false)
 
-	// 发起一个需要连贯物理动作的任务
+	// 发起一个需要局部修改的任务
 	prompt := `
-	请帮我执行以下操作：
-	1. 用 bash 查看一下我当前电脑的 Go 版本。
-	2. 帮我写一个简单的 helloworld.go 文件，输出 "Hello, go-tiny-claw!"。
-	3. 用 bash 编译并运行这个 go 文件，确认它能正常工作。
+	我当前目录下有一个 server.go 文件。
+	请帮我把里面 "TODO: 增加鉴权逻辑" 下面的那个 if 语句，整个替换为：
+	if user == nil {
+		fmt.Println("Forbidden!")
+		return
+	}
 	`
 
 	err := eng.Run(context.Background(), prompt)
