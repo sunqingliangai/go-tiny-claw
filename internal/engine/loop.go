@@ -6,6 +6,7 @@ import (
 	"log"
 	"sync"
 
+	ctxpkg "github.com/sunqingliangai/go-tiny-claw/internal/context"
 	"github.com/sunqingliangai/go-tiny-claw/internal/provider"
 	"github.com/sunqingliangai/go-tiny-claw/internal/schema"
 	"github.com/sunqingliangai/go-tiny-claw/internal/tools"
@@ -16,6 +17,7 @@ type AgentEngine struct {
 	registry       tools.Registry
 	WorkDir        string
 	EnableThinking bool
+	composer       *ctxpkg.PromptComposer // 【新增】
 }
 
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, workDir string, enableThinking bool) *AgentEngine {
@@ -24,6 +26,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, workDir string, en
 		registry:       r,
 		WorkDir:        workDir,
 		EnableThinking: enableThinking,
+		composer:       ctxpkg.NewPromptComposer(workDir), // 【初始化】
 	}
 }
 
@@ -31,11 +34,11 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 	log.Printf("[Engine] 引擎启动，锁定工作区: %s\n", e.WorkDir)
 	log.Printf("[Engine] 慢思考模式 (Thinking Phase): %v\n", e.EnableThinking)
 
+	// 【核心修改】动态组装 System Prompt
+	systemMsg := e.composer.Build()
+
 	contextHistory := []schema.Message{
-		{
-			Role:    schema.RoleSystem,
-			Content: "You are go-tiny-claw, an expert coding assistant. You have full access to tools in the workspace.",
-		},
+		systemMsg,
 		{
 			Role:    schema.RoleUser,
 			Content: userPrompt,
