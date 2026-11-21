@@ -27,7 +27,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, workDir string, en
 	}
 }
 
-func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
+func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Reporter) error {
 	log.Printf("[Engine] 引擎启动，锁定工作区: %s\n", e.WorkDir)
 	log.Printf("[Engine] 慢思考模式 (Thinking Phase): %v\n", e.EnableThinking)
 
@@ -52,13 +52,18 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 
 		// Phase 1: 慢思考阶段
 		if e.EnableThinking {
+			if reporter != nil {
+				// 【触发 Reporter】: 开始慢思考
+				reporter.OnThinking(ctx)
+			}
+
 			log.Println("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
 			thinkResp, err := e.provider.Generate(ctx, contextHistory, nil)
 			if err != nil {
 				return fmt.Errorf("Thinking 阶段生成失败: %w", err)
 			}
 			if thinkResp.Content != "" {
-				fmt.Printf("🧠 [内部思考 Trace]: \n%s\n", thinkResp.Content)
+				// fmt.Printf("🧠 [内部思考 Trace]: \n%s\n", thinkResp.Content)
 				contextHistory = append(contextHistory, *thinkResp)
 			}
 		}
@@ -72,11 +77,15 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 
 		contextHistory = append(contextHistory, *actionResp)
 
-		if actionResp.Content != "" {
-			fmt.Printf("🤖 [对外回复]: \n%s\n", actionResp.Content)
-		}
+		// if actionResp.Content != "" {
+		// 	fmt.Printf("🤖 [对外回复]: \n%s\n", actionResp.Content)
+		// }
 
 		if len(actionResp.ToolCalls) == 0 {
+			if actionResp.Content != "" && reporter != nil {
+				// 【触发 Reporter】: 只把没有后续 Tool Call 的内容作为最终回复
+				reporter.OnMessage(ctx, actionResp.Content)
+			}
 			log.Println("[Engine] 模型回复中不含tool_call，任务宣告完成。")
 			break
 		}
@@ -95,10 +104,20 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 			go func(idx int, call schema.ToolCall) {
 				defer wg.Done()
 
+				if reporter != nil {
+					// 【触发 Reporter】: 报告即将在底层执行的工具
+					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
+				}
+
 				log.Printf("  -> [Go-%d] 🛠️ 触发并行执行: %s\n", idx, call.Name)
 
 				// 执行底层工具
 				result := e.registry.Execute(ctx, call)
+
+				if reporter != nil {
+					// 注意：传递给大模型的 Observation 仍是完整数据，Reporter 只展示缩略内容
+					reporter.OnToolResult(ctx, call.Name, previewForReporter(result.Output, 300), result.IsError)
+				}
 
 				if result.IsError {
 					log.Printf("  -> [Go-%d] ❌ 工具执行报错: %s\n", idx, result.Output)
@@ -125,4 +144,12 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string) error {
 	}
 
 	return nil
+}
+
+func previewForReporter(content string, limit int) string {
+	runes := []rune(content)
+	if len(runes) <= limit {
+		return content
+	}
+	return string(runes[:limit]) + "... (已截断)"
 }
