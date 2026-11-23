@@ -24,7 +24,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 		provider:       p,
 		registry:       r,
 		EnableThinking: enableThinking,
-		compactor:      ctxpkg.NewCompactor(3000, 6), // 测试时使用较低阈值，保护区设为 6
+		compactor:      ctxpkg.NewCompactor(20000, 6), // Plan Mode 提示较长，使用较宽阈值并保护最近 6 条
 	}
 }
 
@@ -34,8 +34,11 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	log.Printf("[Engine] 唤醒会话 [%s]\n", session.ID)
 	log.Printf("[Engine] 慢思考模式 (Thinking Phase): %v\n", e.EnableThinking)
 
-	// 根据当前 Session 的工作区，动态组装最新的 System Prompt。
-	composer := ctxpkg.NewPromptComposer(session.WorkDir)
+	// 根据当前 Session 的工作区和计划模式，动态组装最新的 System Prompt。
+	// 与 ch13 快照不同：PlanMode 按 Session 管理，因此每次 Run 重新创建 Composer。
+	planMode, taskDir := session.PlanModeSnapshot()
+	log.Printf("[Engine] Plan Mode: %v", planMode)
+	composer := ctxpkg.NewPromptComposer(session.WorkDir, planMode, taskDir)
 	systemMsg := composer.Build()
 
 	turnCount := 0
@@ -78,6 +81,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		}
 
 		// Phase 2: 行动阶段
+		// 保留本项目既有的 Thinking/Action 消息结构，不移植 ch13 的合并修正。
 		log.Println("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
 		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
 		if err != nil {

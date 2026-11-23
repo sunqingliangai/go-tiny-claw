@@ -14,6 +14,9 @@ type Session struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 
+	planMode bool
+	taskDir  string
+
 	// 存放此 Session 中所有的用户输入、大模型回复和工具调用结果
 	history []schema.Message
 	mu      sync.RWMutex // 读写锁，防止并发读写历史时发生 Data Race
@@ -27,6 +30,25 @@ func NewSession(id string, workDir string) *Session {
 		UpdatedAt: time.Now(),
 		history:   make([]schema.Message, 0),
 	}
+}
+
+// ConfigurePlanMode 设置当前 Session 的计划模式和任务状态目录。
+func (s *Session) ConfigurePlanMode(enabled bool, taskDir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.planMode = enabled
+	if taskDir != "" {
+		s.taskDir = taskDir
+	}
+	s.UpdatedAt = time.Now()
+}
+
+// PlanModeSnapshot 返回当前计划模式配置。
+func (s *Session) PlanModeSnapshot() (bool, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.planMode, s.taskDir
 }
 
 // Append 线程安全地向 Session 中追加消息
@@ -53,9 +75,19 @@ func (s *Session) GetWorkingMemory(limit int) []schema.Message {
 		return res
 	}
 
-	// 截取最近的 limit 条消息
-	res := make([]schema.Message, limit)
-	copy(res, s.history[total-limit:])
+	// 先定位目标窗口起点；如果起点不是普通用户消息，就向前扩展到最近一条用户输入。
+	// 否则 ReAct 工具循环达到窗口上限后，Provider 可能收到以 Assistant ToolCall 开头的非法消息序列。
+	start := total - limit
+	for start > 0 {
+		if s.history[start].Role == schema.RoleUser && s.history[start].ToolCallID == "" {
+			break
+		}
+		start--
+	}
+
+	// 截取从用户输入边界到最新的连续历史。
+	res := make([]schema.Message, total-start)
+	copy(res, s.history[start:])
 
 	// 【驾驭防线】：大模型 API 强制要求历史消息的连续性。
 	// 如果截断后的首条消息是失去 ToolCall 的 ToolResult，

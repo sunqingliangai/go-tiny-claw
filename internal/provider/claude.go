@@ -53,9 +53,9 @@ func (p *ClaudeProvider) Generate(ctx context.Context, msgs []schema.Message, av
 			}
 		case schema.RoleAssistant:
 			var blocks []anthropic.ContentBlockParamUnion
-			if msg.Content != "" {
-				blocks = append(blocks, anthropic.NewTextBlock(msg.Content))
-			}
+			// 智谱 Claude 兼容端点要求 Assistant 消息至少包含一个 block；
+			// 即使只有 ToolCall，也要显式发送空 TextBlock，避免 1214 参数错误。
+			blocks = append(blocks, anthropic.NewTextBlock(msg.Content))
 			for _, tc := range msg.ToolCalls {
 				// 新版 SDK：手动构造 ToolUse block
 				var inputMap map[string]interface{}

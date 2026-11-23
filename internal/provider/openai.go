@@ -50,10 +50,10 @@ func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, av
 		case schema.RoleAssistant:
 			astParam := openai.ChatCompletionAssistantMessageParam{}
 
-			if msg.Content != "" {
-				astParam.Content = openai.ChatCompletionAssistantMessageParamContentUnion{
-					OfString: openai.String(msg.Content),
-				}
+			// 智谱 OpenAI 兼容端点要求带 ToolCall 的 Assistant 消息显式携带 content，
+			// 即使内容为空字符串，否则会返回 1214 messages 参数非法。
+			astParam.Content = openai.ChatCompletionAssistantMessageParamContentUnion{
+				OfString: openai.String(msg.Content),
 			}
 
 			if len(msg.ToolCalls) > 0 {

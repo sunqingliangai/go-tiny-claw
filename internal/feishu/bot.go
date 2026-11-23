@@ -3,6 +3,7 @@ package feishu
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -27,6 +28,7 @@ const (
 	maxPromptRuneCount   = 12000
 	messageDedupTTL      = 10 * time.Minute
 	maxDedupMessageCount = 4096
+	planModeUsage        = "使用 /plan <任务> 开启计划模式，或使用 /plan off 关闭计划模式。"
 )
 
 // Config 封装飞书长连接运行参数。App Secret 只从环境变量注入。
@@ -51,10 +53,19 @@ type Bot struct {
 }
 
 type inboundMessage struct {
-	MessageID string
-	ChatID    string
-	Prompt    string
+	MessageID   string
+	ChatID      string
+	Prompt      string
+	PlanControl planControl
 }
+
+type planControl int
+
+const (
+	planControlNone planControl = iota
+	planControlEnable
+	planControlDisable
+)
 
 func NewBot(eng *engine.AgentEngine, cfg Config) (*Bot, error) {
 	if eng == nil {
@@ -140,13 +151,17 @@ func (b *Bot) runWorker(ctx context.Context) {
 }
 
 func (b *Bot) handleMessage(_ context.Context, event *larkim.P2MessageReceiveV1) error {
+	log.Printf("ssss进入handleMessage")
 	// 长连接事件 Handler 必须尽快返回。这里只做轻量校验和入队。
+	// 飞书事件字段大量使用指针，先排除事件或关键对象为空的情况，避免解引用 panic。
 	if event == nil || event.Event == nil || event.Event.Sender == nil || event.Event.Message == nil {
+		log.Printf("[Feishu] 收到无效事件，忽略")
 		return nil
 	}
 
 	sender := event.Event.Sender
 	message := event.Event.Message
+	// 只处理真实用户发送的文本消息，忽略机器人消息和其他消息类型。
 	if sender.SenderType == nil || *sender.SenderType != "user" {
 		return nil
 	}
@@ -157,35 +172,52 @@ func (b *Bot) handleMessage(_ context.Context, event *larkim.P2MessageReceiveV1)
 		return nil
 	}
 
+	// 将事件中的指针值复制出来，后续校验和任务入队都使用这些稳定值。
 	messageID := *message.MessageId
 	chatID := *message.ChatId
 	rawContent := *message.Content
 
+	log.Printf("[Feishu] 收到消息事件 message_id=%s chat_id=%s", messageID, chatID)
+
+	// 飞书文本消息的 Content 是 JSON 字符串，例如 {"text":"hello"}。
 	var content textMessageContent
 	if err := json.Unmarshal([]byte(rawContent), &content); err != nil {
 		log.Printf("[Feishu] 解析文本消息失败 message_id=%s: %v", messageID, err)
 		return nil
 	}
 
+	// 去掉机器人 mention 和首尾空白；空消息直接忽略。
 	prompt := strings.TrimSpace(stripBotMentions(content.Text, message.Mentions))
 	if prompt == "" {
 		return nil
 	}
-	if utf8.RuneCountInString(prompt) > maxPromptRuneCount {
+
+	// 先解析 /plan 控制命令，再对真正的任务文本做长度校验。
+	taskPrompt, planControl := parsePlanControl(prompt)
+	if planControl == planControlEnable && taskPrompt == "" {
+		b.notifyAsync(messageID, planModeUsage)
+		return nil
+	}
+	if utf8.RuneCountInString(taskPrompt) > maxPromptRuneCount {
 		b.notifyAsync(messageID, fmt.Sprintf("消息过长，请控制在 %d 个字符以内。", maxPromptRuneCount))
 		return nil
 	}
+
+	// 飞书可能重复推送同一事件；message_id 去重保证同一消息不会执行两次 Agent。
 	if !b.seen.MarkIfNew(messageID) {
 		log.Printf("[Feishu] 忽略重复推送 message_id=%s", messageID)
 		return nil
 	}
 
+	// inboundMessage 只携带 Worker 执行所需的不可变数据。
 	task := inboundMessage{
-		MessageID: messageID,
-		ChatID:    chatID,
-		Prompt:    prompt,
+		MessageID:   messageID,
+		ChatID:      chatID,
+		Prompt:      taskPrompt,
+		PlanControl: planControl,
 	}
 
+	// 非阻塞入队：Handler 不在飞书事件线程中运行 Agent，队列满时快速拒绝并异步提示。
 	select {
 	case b.queue <- task:
 		log.Printf("[Feishu] 已接收消息 message_id=%s chat_id=%s", messageID, chatID)
@@ -199,24 +231,69 @@ func (b *Bot) handleMessage(_ context.Context, event *larkim.P2MessageReceiveV1)
 
 func (b *Bot) handleAgentTask(parent context.Context, task inboundMessage) {
 	// 当前所有任务共享 WorkDir，因此使用单 Worker 串行执行，避免物理文件竞争。
+	// 每个任务使用独立超时 Context；父 Context 取消时，正在运行的 Agent 也能收到取消信号。
+	log.Printf("ssss进入handleAgentTask message_id=%s chat_id=%s plan_control=%d", task.MessageID, task.ChatID, task.PlanControl)
 	ctx, cancel := context.WithTimeout(parent, b.taskTimeout)
 	defer cancel()
 
+	// Reporter 绑定原始飞书消息，最终结果和错误会回复到对应的消息会话。
 	reporter := newFeishuReporter(b.client, task.MessageID)
 
 	// 按飞书 chat_id 隔离会话：同一个群或单聊共享连续上下文。
 	session := ctxpkg.GlobalSessionMgr.GetOrCreate(task.ChatID, b.workDir)
+
+	// 每个聊天使用稳定哈希目录，避免不同群同时把计划写到根目录而互相覆盖。
+	taskDir := planTaskDir(task.ChatID)
+
+	// /plan 和 /plan off 是控制命令：只更新 Session 状态，不把命令文本发给模型。
+	switch task.PlanControl {
+	case planControlEnable:
+		session.ConfigurePlanMode(true, taskDir)
+		log.Printf("[Feishu] Plan Mode 已开启 chat_id=%s task_dir=%s", task.ChatID, taskDir)
+	case planControlDisable:
+		session.ConfigurePlanMode(false, taskDir)
+		log.Printf("[Feishu] Plan Mode 已关闭 chat_id=%s", task.ChatID)
+		reporter.OnMessage(ctx, "计划模式已关闭啦。")
+		return
+	}
+
+	// 用户任务先进入 Session；Engine 会把 Session 中最近的有效消息投影为 Working Memory。
 	session.Append(schema.Message{
 		Role:    schema.RoleUser,
 		Content: task.Prompt,
 	})
 
+	// Run 会阻塞到本轮 ReAct 结束；单 Worker 因此天然保证同一时刻只有一个 Agent Run。
 	if err := b.engine.Run(ctx, session, reporter); err != nil {
 		log.Printf("[Feishu] Agent 运行失败 message_id=%s: %v", task.MessageID, err)
+		// 父 Context 已取消时不再尝试发送错误消息，避免进程退出阶段产生无意义网络请求。
 		if parent.Err() == nil {
 			reporter.SendError(fmt.Sprintf("Agent 运行失败: %v", err))
 		}
 	}
+}
+
+func parsePlanControl(prompt string) (string, planControl) {
+	if prompt == "/plan" {
+		return "", planControlEnable
+	}
+	if prompt == "/plan off" {
+		return "", planControlDisable
+	}
+	if strings.HasPrefix(prompt, "/plan ") {
+		task := strings.TrimSpace(strings.TrimPrefix(prompt, "/plan "))
+		if task == "off" {
+			return "", planControlDisable
+		}
+		return task, planControlEnable
+	}
+	return prompt, planControlNone
+}
+
+func planTaskDir(chatID string) string {
+	// 使用稳定哈希隔离各聊天，避免外部 chat_id 直接进入文件路径。
+	sum := sha256.Sum256([]byte("feishu:" + chatID))
+	return fmt.Sprintf(".claw/tasks/%x", sum[:8])
 }
 
 func (b *Bot) notifyAsync(messageID, text string) {
