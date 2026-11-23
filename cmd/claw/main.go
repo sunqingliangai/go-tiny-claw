@@ -39,11 +39,12 @@ func main() {
 	registry.Register(tools.NewEditFileTool(workDir))
 
 	// 开启慢思考
-	eng := engine.NewAgentEngine(llmProvider, registry, workDir, false)
+	eng := engine.NewAgentEngine(llmProvider, registry, false)
 
 	bot, err := feishu.NewBot(eng, feishu.Config{
 		AppID:       os.Getenv("FEISHU_APP_ID"),
 		AppSecret:   os.Getenv("FEISHU_APP_SECRET"),
+		WorkDir:     workDir,
 		QueueSize:   8,
 		TaskTimeout: 10 * time.Minute,
 	})

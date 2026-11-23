@@ -15,35 +15,26 @@ import (
 type AgentEngine struct {
 	provider       provider.LLMProvider
 	registry       tools.Registry
-	WorkDir        string
 	EnableThinking bool
-	composer       *ctxpkg.PromptComposer // 【新增】
 }
 
-func NewAgentEngine(p provider.LLMProvider, r tools.Registry, workDir string, enableThinking bool) *AgentEngine {
+func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking bool) *AgentEngine {
 	return &AgentEngine{
 		provider:       p,
 		registry:       r,
-		WorkDir:        workDir,
 		EnableThinking: enableThinking,
-		composer:       ctxpkg.NewPromptComposer(workDir), // 【初始化】
 	}
 }
 
-func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Reporter) error {
-	log.Printf("[Engine] 引擎启动，锁定工作区: %s\n", e.WorkDir)
+// Run 接收 Session 参数，使用会话历史驱动 ReAct 循环。
+func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter Reporter) error {
+	log.Printf("[Engine] 引擎启动，锁定工作区: %s\n", session.WorkDir)
+	log.Printf("[Engine] 唤醒会话 [%s]\n", session.ID)
 	log.Printf("[Engine] 慢思考模式 (Thinking Phase): %v\n", e.EnableThinking)
 
-	// 【核心修改】动态组装 System Prompt
-	systemMsg := e.composer.Build()
-
-	contextHistory := []schema.Message{
-		systemMsg,
-		{
-			Role:    schema.RoleUser,
-			Content: userPrompt,
-		},
-	}
+	// 根据当前 Session 的工作区，动态组装最新的 System Prompt。
+	composer := ctxpkg.NewPromptComposer(session.WorkDir)
+	systemMsg := composer.Build()
 
 	turnCount := 0
 
@@ -52,6 +43,14 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 		log.Printf("\n========== [Turn %d] 开始 ==========\n", turnCount)
 
 		availableTools := e.registry.GetAvailableTools()
+
+		// 获取短期工作记忆，并与 System Prompt 组装成本轮上下文。
+		workingMemory := session.GetWorkingMemory(6)
+		log.Printf("[Engine] 本轮加载 %d 条 Working Memory\n", len(workingMemory))
+
+		var contextHistory []schema.Message
+		contextHistory = append(contextHistory, systemMsg)
+		contextHistory = append(contextHistory, workingMemory...)
 
 		// Phase 1: 慢思考阶段
 		if e.EnableThinking {
@@ -67,6 +66,8 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 			}
 			if thinkResp.Content != "" {
 				// fmt.Printf("🧠 [内部思考 Trace]: \n%s\n", thinkResp.Content)
+				// 将思考过程追加到 Session，并同步到当前这一轮的临时上下文。
+				session.Append(*thinkResp)
 				contextHistory = append(contextHistory, *thinkResp)
 			}
 		}
@@ -78,6 +79,8 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 			return fmt.Errorf("Action 阶段生成失败: %w", err)
 		}
 
+		// 将大模型的行动响应追加到 Session。
+		session.Append(*actionResp)
 		contextHistory = append(contextHistory, *actionResp)
 
 		// if actionResp.Content != "" {
@@ -140,10 +143,8 @@ func (e *AgentEngine) Run(ctx context.Context, userPrompt string, reporter Repor
 		wg.Wait() // 阻塞聚合
 		log.Println("[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...")
 
-		// 按序追加回 Context
-		for _, obs := range observationMsgs {
-			contextHistory = append(contextHistory, obs)
-		}
+		// 将全部工具执行结果追加到 Session，开启下一轮复盘与推理。
+		session.Append(observationMsgs...)
 	}
 
 	return nil

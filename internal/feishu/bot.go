@@ -16,7 +16,9 @@ import (
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
+	ctxpkg "github.com/sunqingliangai/go-tiny-claw/internal/context"
 	"github.com/sunqingliangai/go-tiny-claw/internal/engine"
+	"github.com/sunqingliangai/go-tiny-claw/internal/schema"
 )
 
 const (
@@ -31,6 +33,7 @@ const (
 type Config struct {
 	AppID       string
 	AppSecret   string
+	WorkDir     string
 	QueueSize   int
 	TaskTimeout time.Duration
 }
@@ -41,6 +44,7 @@ type Bot struct {
 	appSecret   string
 	client      *lark.Client
 	engine      *engine.AgentEngine
+	workDir     string
 	queue       chan inboundMessage
 	seen        *messageDeduper
 	taskTimeout time.Duration
@@ -59,6 +63,9 @@ func NewBot(eng *engine.AgentEngine, cfg Config) (*Bot, error) {
 	if strings.TrimSpace(cfg.AppID) == "" || strings.TrimSpace(cfg.AppSecret) == "" {
 		return nil, fmt.Errorf("请设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
 	}
+	if strings.TrimSpace(cfg.WorkDir) == "" {
+		return nil, fmt.Errorf("工作目录不能为空")
+	}
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueueSize
 	}
@@ -71,6 +78,7 @@ func NewBot(eng *engine.AgentEngine, cfg Config) (*Bot, error) {
 		appSecret:   cfg.AppSecret,
 		client:      lark.NewClient(cfg.AppID, cfg.AppSecret),
 		engine:      eng,
+		workDir:     cfg.WorkDir,
 		queue:       make(chan inboundMessage, cfg.QueueSize),
 		seen:        newMessageDeduper(messageDedupTTL, maxDedupMessageCount),
 		taskTimeout: cfg.TaskTimeout,
@@ -195,7 +203,15 @@ func (b *Bot) handleAgentTask(parent context.Context, task inboundMessage) {
 	defer cancel()
 
 	reporter := newFeishuReporter(b.client, task.MessageID)
-	if err := b.engine.Run(ctx, task.Prompt, reporter); err != nil {
+
+	// 按飞书 chat_id 隔离会话：同一个群或单聊共享连续上下文。
+	session := ctxpkg.GlobalSessionMgr.GetOrCreate(task.ChatID, b.workDir)
+	session.Append(schema.Message{
+		Role:    schema.RoleUser,
+		Content: task.Prompt,
+	})
+
+	if err := b.engine.Run(ctx, session, reporter); err != nil {
 		log.Printf("[Feishu] Agent 运行失败 message_id=%s: %v", task.MessageID, err)
 		if parent.Err() == nil {
 			reporter.SendError(fmt.Sprintf("Agent 运行失败: %v", err))
