@@ -16,6 +16,7 @@ type AgentEngine struct {
 	provider       provider.LLMProvider
 	registry       tools.Registry
 	EnableThinking bool
+	compactor      *ctxpkg.Compactor // 【新增】
 }
 
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking bool) *AgentEngine {
@@ -23,6 +24,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 		provider:       p,
 		registry:       r,
 		EnableThinking: enableThinking,
+		compactor:      ctxpkg.NewCompactor(3000, 6), // 测试时使用较低阈值，保护区设为 6
 	}
 }
 
@@ -44,13 +46,16 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 		availableTools := e.registry.GetAvailableTools()
 
-		// 获取短期工作记忆，并与 System Prompt 组装成本轮上下文。
-		workingMemory := session.GetWorkingMemory(6)
+		// 提取更大的候选窗口，给 Compactor 留出判断空间。
+		workingMemory := session.GetWorkingMemory(20)
 		log.Printf("[Engine] 本轮加载 %d 条 Working Memory\n", len(workingMemory))
 
 		var contextHistory []schema.Message
 		contextHistory = append(contextHistory, systemMsg)
 		contextHistory = append(contextHistory, workingMemory...)
+
+		// 【核心防线】在向大模型发起请求前，执行上下文阶梯降级压缩。
+		compactedContext := e.compactor.Compact(contextHistory)
 
 		// Phase 1: 慢思考阶段
 		if e.EnableThinking {
@@ -60,7 +65,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 			}
 
 			log.Println("[Engine][Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
-			thinkResp, err := e.provider.Generate(ctx, contextHistory, nil)
+			thinkResp, err := e.provider.Generate(ctx, compactedContext, nil)
 			if err != nil {
 				return fmt.Errorf("Thinking 阶段生成失败: %w", err)
 			}
@@ -68,20 +73,20 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 				// fmt.Printf("🧠 [内部思考 Trace]: \n%s\n", thinkResp.Content)
 				// 将思考过程追加到 Session，并同步到当前这一轮的临时上下文。
 				session.Append(*thinkResp)
-				contextHistory = append(contextHistory, *thinkResp)
+				compactedContext = append(compactedContext, *thinkResp)
 			}
 		}
 
 		// Phase 2: 行动阶段
 		log.Println("[Engine][Phase 2] 恢复工具挂载，等待模型采取行动...")
-		actionResp, err := e.provider.Generate(ctx, contextHistory, availableTools)
+		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
 		if err != nil {
 			return fmt.Errorf("Action 阶段生成失败: %w", err)
 		}
 
 		// 将大模型的行动响应追加到 Session。
 		session.Append(*actionResp)
-		contextHistory = append(contextHistory, *actionResp)
+		compactedContext = append(compactedContext, *actionResp)
 
 		// if actionResp.Content != "" {
 		// 	fmt.Printf("🤖 [对外回复]: \n%s\n", actionResp.Content)
