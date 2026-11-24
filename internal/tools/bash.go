@@ -4,8 +4,10 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/sunqingliangai/go-tiny-claw/internal/schema"
@@ -47,7 +49,7 @@ type bashArgs struct {
 func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var input bashArgs
 	if err := json.Unmarshal(args, &input); err != nil {
-		return "", fmt.Errorf("参数解析失败: %w", err)
+		return "", NewToolError(schema.ErrorCodeInvalidArguments, "参数解析失败", true, err)
 	}
 
 	// 【驾驭底线 1】：Time Budgeting (时间预算与超时控制)
@@ -66,27 +68,59 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	out, err := cmd.CombinedOutput()
 	outputStr := string(out)
 
-	// 如果命令执行超时，返回警告信息让模型知晓
-	if timeoutCtx.Err() == context.DeadlineExceeded {
-		return outputStr + "\n[警告: 命令执行超时(30s)，已被系统强制终止。如果是启动常驻服务，请尝试将其转入后台。]", nil
+	// 错误输出也可能极大，因此在分类和回填 Context 之前统一截断。
+	const maxLen = 8000
+	if len(outputStr) > maxLen {
+		outputStr = fmt.Sprintf("%s\n\n...[终端输出过长，已截断至前 %d 字节]...", outputStr[:maxLen], maxLen)
 	}
 
-	// 【驾驭底线 3】：错误原样回传 (Self-Correction 自愈机制)
-	// 当 bash 报错时（err != nil），我们绝对不能返回 Go 的 error 阻断程序！
-	// 我们必须把 err 和 outputStr 拼接成字符串返回，利用大模型的自纠错能力自己分析报错！
+	// 如果命令执行超时，返回警告信息让模型知晓
+	if timeoutCtx.Err() == context.DeadlineExceeded {
+		return "", &ToolError{
+			Code:      schema.ErrorCodeBashTimeout,
+			Message:   "命令执行超时(30s)，已被系统强制终止",
+			Output:    outputStr,
+			Retryable: false,
+		}
+	}
+	if timeoutCtx.Err() == context.Canceled {
+		return "", &ToolError{
+			Code:      schema.ErrorCodeToolCanceled,
+			Message:   "命令执行被取消",
+			Output:    outputStr,
+			Retryable: false,
+			Err:       timeoutCtx.Err(),
+		}
+	}
+
+	// 【驾驭底线 3】：结构化回传错误。
+	// Registry 会把 ToolError 转成 IsError=true 的 ToolResult，Engine 继续循环让模型自纠，
+	// 而不会把工具失败当成 Harness 致命错误直接退出。
 	if err != nil {
-		return fmt.Sprintf("执行报错: %v\n输出:\n%s", err, outputStr), nil
+		code := schema.ErrorCodeBashExitNonzero
+		retryable := false
+
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 127 {
+			code = schema.ErrorCodeBashCommandNotFound
+		} else if strings.Contains(strings.ToLower(outputStr), "command not found") {
+			code = schema.ErrorCodeBashCommandNotFound
+		} else if errors.Is(err, exec.ErrNotFound) {
+			code = schema.ErrorCodeBashStartFailed
+		}
+
+		return "", &ToolError{
+			Code:      code,
+			Message:   "命令执行失败",
+			Output:    outputStr,
+			Retryable: retryable,
+			Err:       err,
+		}
 	}
 
 	// 如果没有终端输出（比如仅仅执行了 mkdir），给模型一个明确的执行成功的反馈
 	if outputStr == "" {
 		return "命令执行成功，无终端输出。", nil
-	}
-
-	// 【驾驭底线 4】：长度截断保护 (防 OOM)
-	const maxLen = 8000
-	if len(outputStr) > maxLen {
-		return fmt.Sprintf("%s\n\n...[终端输出过长，已截断至前 %d 字节]...", outputStr[:maxLen], maxLen), nil
 	}
 
 	return outputStr, nil

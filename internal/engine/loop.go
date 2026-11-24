@@ -16,7 +16,8 @@ type AgentEngine struct {
 	provider       provider.LLMProvider
 	registry       tools.Registry
 	EnableThinking bool
-	compactor      *ctxpkg.Compactor // 【新增】
+	compactor      *ctxpkg.Compactor       // 【新增】
+	recovery       *ctxpkg.RecoveryManager // 【新增】自愈管理器
 }
 
 func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking bool) *AgentEngine {
@@ -25,6 +26,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 		registry:       r,
 		EnableThinking: enableThinking,
 		compactor:      ctxpkg.NewCompactor(20000, 6), // Plan Mode 提示较长，使用较宽阈值并保护最近 6 条
+		recovery:       ctxpkg.NewRecoveryManager(),   // 初始化 Recovery
 	}
 }
 
@@ -129,9 +131,22 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 				// 执行底层工具
 				result := e.registry.Execute(ctx, call)
 
+				// 发生错误时保留原始事实，并注入当前工具相关的恢复建议。
+				finalOutput := result.Output
+				if result.IsError {
+					finalOutput = e.recovery.AnalyzeAndInject(call.Name, result)
+					log.Printf(
+						"  -> [Go-%d] 🩹 注入救援指南: tool=%s code=%s retryable=%v\n",
+						idx,
+						call.Name,
+						result.ErrorCode,
+						result.Retryable,
+					)
+				}
+
 				if reporter != nil {
 					// 注意：传递给大模型的 Observation 仍是完整数据，Reporter 只展示缩略内容
-					reporter.OnToolResult(ctx, call.Name, previewForReporter(result.Output, 300), result.IsError)
+					reporter.OnToolResult(ctx, call.Name, previewForReporter(finalOutput, 300), result.IsError)
 				}
 
 				if result.IsError {
@@ -143,7 +158,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 				// 安全写入对应索引
 				observationMsgs[idx] = schema.Message{
 					Role:       schema.RoleUser,
-					Content:    result.Output,
+					Content:    finalOutput,
 					ToolCallID: call.ID,
 				}
 			}(i, toolCall)

@@ -4,6 +4,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 
@@ -73,6 +74,7 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 			ToolCallID: call.ID,
 			Output:     errMsg,
 			IsError:    true, // 标记为错误，模型看到后会尝试纠正
+			ErrorCode:  schema.ErrorCodeToolNotFound,
 		}
 	}
 
@@ -81,11 +83,23 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 
 	// 3. 封装结果：将执行结果或底层物理错误封装后返回给 Main Loop
 	if err != nil {
+		var toolErr *ToolError
+		if errors.As(err, &toolErr) {
+			return schema.ToolResult{
+				ToolCallID: call.ID,
+				Output:     toolErr.ModelOutput(call.Name),
+				IsError:    true,
+				ErrorCode:  toolErr.Code,
+				Retryable:  toolErr.Retryable,
+			}
+		}
+
 		errMsg := fmt.Sprintf("Error executing %s: %v", call.Name, err)
 		return schema.ToolResult{
 			ToolCallID: call.ID,
 			Output:     errMsg,
 			IsError:    true,
+			ErrorCode:  schema.ErrorCodeToolInternal,
 		}
 	}
 

@@ -58,7 +58,7 @@ type editFileArgs struct {
 func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var input editFileArgs
 	if err := json.Unmarshal(args, &input); err != nil {
-		return "", fmt.Errorf("参数解析失败: %w", err)
+		return "", NewToolError(schema.ErrorCodeInvalidArguments, "参数解析失败", true, err)
 	}
 
 	fullPath := filepath.Join(t.workDir, input.Path)
@@ -66,7 +66,7 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	// 1. 读取原文件内容
 	contentBytes, err := os.ReadFile(fullPath)
 	if err != nil {
-		return "", fmt.Errorf("读取文件失败，请确认路径是否正确: %w", err)
+		return "", classifyFileError("读取文件失败，请确认路径是否正确", err)
 	}
 	originalContent := string(contentBytes)
 
@@ -79,7 +79,7 @@ func (t *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 
 	// 3. 将新内容安全地写回磁盘
 	if err := os.WriteFile(fullPath, []byte(newContent), 0644); err != nil {
-		return "", fmt.Errorf("写回文件失败: %w", err)
+		return "", classifyFileError("写回文件失败", err)
 	}
 
 	return fmt.Sprintf("✅ 成功修改文件: %s", input.Path), nil
@@ -93,7 +93,12 @@ func fuzzyReplace(originalContent, oldText, newText string) (string, error) {
 		return strings.Replace(originalContent, oldText, newText, 1), nil
 	}
 	if count > 1 {
-		return "", fmt.Errorf("old_text 匹配到了 %d 处，请提供更多的上下文代码以确保唯一性", count)
+		return "", NewToolError(
+			schema.ErrorCodeEditOldTextAmbiguous,
+			fmt.Sprintf("old_text 匹配到了 %d 处，请提供更多的上下文代码以确保唯一性", count),
+			true,
+			nil,
+		)
 	}
 
 	// L2: 换行符归一化 (统一将 \r\n 转换为 \n)
@@ -127,7 +132,7 @@ func lineByLineReplace(content, oldText, newText string) (string, error) {
 	oldLines := strings.Split(strings.TrimSpace(oldText), "\n")
 
 	if len(oldLines) == 0 || len(contentLines) < len(oldLines) {
-		return "", fmt.Errorf("找不到该代码片段")
+		return "", NewToolError(schema.ErrorCodeEditOldTextNotFound, "找不到该代码片段", true, nil)
 	}
 
 	// 清理 oldLines 的每行首尾空白
@@ -157,10 +162,20 @@ func lineByLineReplace(content, oldText, newText string) (string, error) {
 	}
 
 	if matchCount == 0 {
-		return "", fmt.Errorf("在文件中未找到 old_text，请大模型先调用 read_file 仔细确认文件内容和缩进")
+		return "", NewToolError(
+			schema.ErrorCodeEditOldTextNotFound,
+			"在文件中未找到 old_text，请大模型先调用 read_file 仔细确认文件内容和缩进",
+			true,
+			nil,
+		)
 	}
 	if matchCount > 1 {
-		return "", fmt.Errorf("模糊匹配到了 %d 处相似代码，请提供更多上下行代码以精确定位", matchCount)
+		return "", NewToolError(
+			schema.ErrorCodeEditOldTextAmbiguous,
+			fmt.Sprintf("模糊匹配到了 %d 处相似代码，请提供更多上下行代码以精确定位", matchCount),
+			true,
+			nil,
+		)
 	}
 
 	// 执行替换：将匹配到的原始行范围替换为 newText 拆分后的行
