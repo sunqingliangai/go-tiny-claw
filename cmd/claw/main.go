@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,9 @@ func main() {
 	registry.Register(tools.NewBashTool(workDir))
 	registry.Register(tools.NewEditFileTool(workDir))
 
+	// 本章默认策略：工作区内文件工具放行，Bash 必须经过飞书人工审批。
+	registry.Use(tools.NewDefaultPolicy(workDir))
+
 	// 开启慢思考
 	eng := engine.NewAgentEngine(llmProvider, registry, false)
 
@@ -47,6 +51,7 @@ func main() {
 		WorkDir:     workDir,
 		QueueSize:   8,
 		TaskTimeout: 10 * time.Minute,
+		ApproverIDs: strings.Split(os.Getenv("FEISHU_APPROVER_IDS"), ","),
 	})
 	if err != nil {
 		log.Fatalf("初始化飞书机器人失败: %v", err)

@@ -30,6 +30,16 @@ func TestRecoveryManagerUsesStructuredErrorCode(t *testing.T) {
 			code:     schema.ErrorCodeBashTimeout,
 			wantHint: "缩小执行范围",
 		},
+		{
+			name:     "policy denied",
+			code:     schema.ErrorCodePolicyDenied,
+			wantHint: "不要尝试换写法绕过",
+		},
+		{
+			name:     "approval timeout",
+			code:     schema.ErrorCodeApprovalTimeout,
+			wantHint: "不要自动重试",
+		},
 	}
 
 	for _, test := range tests {

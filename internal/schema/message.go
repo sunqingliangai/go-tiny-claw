@@ -38,6 +38,12 @@ const (
 	ErrorCodeBashTimeout          ErrorCode = "BASH_TIMEOUT"
 	ErrorCodeBashCommandNotFound  ErrorCode = "BASH_COMMAND_NOT_FOUND"
 	ErrorCodeBashStartFailed      ErrorCode = "BASH_START_FAILED"
+	ErrorCodePolicyDenied         ErrorCode = "POLICY_DENIED"
+	ErrorCodeApprovalRejected     ErrorCode = "APPROVAL_REJECTED"
+	ErrorCodeApprovalTimeout      ErrorCode = "APPROVAL_TIMEOUT"
+	ErrorCodeApprovalCanceled     ErrorCode = "APPROVAL_CANCELED"
+	ErrorCodeApprovalMismatch     ErrorCode = "APPROVAL_MISMATCH"
+	ErrorCodeApprovalUnavailable  ErrorCode = "APPROVAL_UNAVAILABLE"
 )
 
 type ToolResult struct {

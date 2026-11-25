@@ -21,6 +21,7 @@ import (
 	ctxpkg "github.com/sunqingliangai/go-tiny-claw/internal/context"
 	"github.com/sunqingliangai/go-tiny-claw/internal/engine"
 	"github.com/sunqingliangai/go-tiny-claw/internal/schema"
+	"github.com/sunqingliangai/go-tiny-claw/internal/tools"
 )
 
 const (
@@ -39,6 +40,7 @@ type Config struct {
 	WorkDir     string
 	QueueSize   int
 	TaskTimeout time.Duration
+	ApproverIDs []string
 }
 
 // Bot 将飞书长连接事件桥接到 Agent Engine。
@@ -51,11 +53,13 @@ type Bot struct {
 	queue       chan inboundMessage
 	seen        *messageDeduper
 	taskTimeout time.Duration
+	approvals   *approvalManager
 }
 
 type inboundMessage struct {
 	MessageID   string
 	ChatID      string
+	SenderID    string
 	Prompt      string
 	PlanControl planControl
 }
@@ -85,7 +89,7 @@ func NewBot(eng *engine.AgentEngine, cfg Config) (*Bot, error) {
 		cfg.TaskTimeout = defaultTaskTimeout
 	}
 
-	return &Bot{
+	bot := &Bot{
 		appID:       cfg.AppID,
 		appSecret:   cfg.AppSecret,
 		client:      lark.NewClient(cfg.AppID, cfg.AppSecret),
@@ -94,7 +98,9 @@ func NewBot(eng *engine.AgentEngine, cfg Config) (*Bot, error) {
 		queue:       make(chan inboundMessage, cfg.QueueSize),
 		seen:        newMessageDeduper(messageDedupTTL, maxDedupMessageCount),
 		taskTimeout: cfg.TaskTimeout,
-	}, nil
+	}
+	bot.approvals = newApprovalManager(cfg.ApproverIDs, bot.sendApprovalNotice)
+	return bot, nil
 }
 
 // Start 建立飞书 WebSocket 长连接，并启动 Workspace 串行 Worker。
@@ -172,6 +178,11 @@ func (b *Bot) handleMessage(_ context.Context, event *larkim.P2MessageReceiveV1)
 	if message.MessageId == nil || message.ChatId == nil || message.Content == nil {
 		return nil
 	}
+	senderID, ok := resolveFeishuSenderID(sender)
+	if !ok {
+		log.Printf("[Feishu] 消息缺少发送者 ID，忽略")
+		return nil
+	}
 
 	// 将事件中的指针值复制出来，后续校验和任务入队都使用这些稳定值。
 	messageID := *message.MessageId
@@ -193,6 +204,19 @@ func (b *Bot) handleMessage(_ context.Context, event *larkim.P2MessageReceiveV1)
 		return nil
 	}
 
+	// 飞书可能重复推送同一事件；message_id TTL 去重同时覆盖审批命令和普通任务。
+	if !b.seen.MarkIfNew(messageID) {
+		log.Printf("[Feishu] 忽略重复推送 message_id=%s", messageID)
+		return nil
+	}
+
+	// 审批命令直接唤醒正在等待的工具协程，不进入 Agent 任务队列。
+	if approvalID, allowed, ok := parseApprovalCommand(prompt); ok {
+		result := b.approvals.ResolveApproval(chatID, senderID, approvalID, allowed)
+		b.notifyAsync(messageID, result)
+		return nil
+	}
+
 	// 先解析 /plan 控制命令，再对真正的任务文本做长度校验。
 	taskPrompt, planControl := parsePlanControl(prompt)
 	if planControl == planControlEnable && taskPrompt == "" {
@@ -204,16 +228,11 @@ func (b *Bot) handleMessage(_ context.Context, event *larkim.P2MessageReceiveV1)
 		return nil
 	}
 
-	// 飞书可能重复推送同一事件；message_id 去重保证同一消息不会执行两次 Agent。
-	if !b.seen.MarkIfNew(messageID) {
-		log.Printf("[Feishu] 忽略重复推送 message_id=%s", messageID)
-		return nil
-	}
-
 	// inboundMessage 只携带 Worker 执行所需的不可变数据。
 	task := inboundMessage{
 		MessageID:   messageID,
 		ChatID:      chatID,
+		SenderID:    senderID,
 		Prompt:      taskPrompt,
 		PlanControl: planControl,
 	}
@@ -236,6 +255,14 @@ func (b *Bot) handleAgentTask(parent context.Context, task inboundMessage) {
 	log.Printf("ssss进入handleAgentTask message_id=%s chat_id=%s plan_control=%d", task.MessageID, task.ChatID, task.PlanControl)
 	ctx, cancel := context.WithTimeout(parent, b.taskTimeout)
 	defer cancel()
+
+	// 当前 Run 的审批身份通过 Context 传给 Registry，避免使用跨聊天全局单例。
+	ctx = withApprovalRunInfo(ctx, approvalRunInfo{
+		ChatID:          task.ChatID,
+		RequesterID:     task.SenderID,
+		SourceMessageID: task.MessageID,
+	})
+	ctx = tools.WithApprover(ctx, b.approvals)
 
 	// Reporter 绑定原始飞书消息，最终结果和错误会回复到对应的消息会话。
 	reporter := newFeishuReporter(b.client, task.MessageID)
@@ -284,6 +311,63 @@ func (b *Bot) handleAgentTask(parent context.Context, task inboundMessage) {
 		if parent.Err() == nil {
 			reporter.SendError(fmt.Sprintf("Agent 运行失败: %v", err))
 		}
+	}
+}
+
+func (b *Bot) sendApprovalNotice(ctx context.Context, notice approvalNotice) error {
+	arguments := truncateRunes(notice.Arguments, 2000)
+	text := fmt.Sprintf(`高危操作审批请求
+
+工具: %s
+原因: %s
+参数:
+%s
+
+审批 ID: %s
+有效期至: %s
+
+请回复 "approve %s" 或 "reject %s"。
+只接受发起本次任务的用户或配置的审批管理员操作。`,
+		notice.ToolName,
+		notice.Reason,
+		arguments,
+		notice.ApprovalID,
+		notice.ExpiresAt.Format("2006-01-02 15:04:05"),
+		notice.ApprovalID,
+		notice.ApprovalID,
+	)
+	uuid := makeReplyUUID(notice.SourceMessageID, "approval:"+notice.ApprovalID, 0)
+	return replyTextWithUUID(ctx, b.client, notice.SourceMessageID, uuid, text)
+}
+
+func resolveFeishuSenderID(sender *larkim.EventSender) (string, bool) {
+	if sender == nil || sender.SenderId == nil {
+		return "", false
+	}
+	for _, id := range []*string{
+		sender.SenderId.UserId,
+		sender.SenderId.OpenId,
+		sender.SenderId.UnionId,
+	} {
+		if id != nil && strings.TrimSpace(*id) != "" {
+			return strings.TrimSpace(*id), true
+		}
+	}
+	return "", false
+}
+
+func parseApprovalCommand(prompt string) (approvalID string, allowed bool, ok bool) {
+	fields := strings.Fields(prompt)
+	if len(fields) != 2 {
+		return "", false, false
+	}
+	switch strings.ToLower(fields[0]) {
+	case "approve":
+		return fields[1], true, true
+	case "reject":
+		return fields[1], false, true
+	default:
+		return "", false, false
 	}
 }
 

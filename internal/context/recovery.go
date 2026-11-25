@@ -53,6 +53,18 @@ func recoveryHintByCode(code schema.ErrorCode) string {
 		return "请求的工具不存在。请只使用当前提供的工具列表。"
 	case schema.ErrorCodeToolCanceled:
 		return "工具执行已取消。不要自动重试，等待新的用户指令或确认任务是否仍然有效。"
+	case schema.ErrorCodePolicyDenied:
+		return "该操作被 Harness 安全策略拒绝。不要尝试换写法绕过，请选择策略允许的替代方案或询问用户。"
+	case schema.ErrorCodeApprovalRejected:
+		return "人工审批已拒绝该操作。不要原样重试，请询问用户新的指令或选择其他方案。"
+	case schema.ErrorCodeApprovalTimeout:
+		return "人工审批已超时，操作没有执行。不要自动重试，请让用户重新发起任务。"
+	case schema.ErrorCodeApprovalCanceled:
+		return "审批因任务取消或中断而失效，操作没有执行。不要自动重试。"
+	case schema.ErrorCodeApprovalMismatch:
+		return "审批绑定的动作与当前请求不一致，操作没有执行。需重新发起审批。"
+	case schema.ErrorCodeApprovalUnavailable:
+		return "当前没有可用的人工审批通道，操作没有执行。不要绕过审批继续尝试。"
 	case schema.ErrorCodeToolInternal:
 		return "工具发生内部错误。不要原样重复相同调用，请检查输入或改用其他可用工具。"
 	}

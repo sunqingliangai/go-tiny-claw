@@ -264,6 +264,8 @@ type alwaysFailRegistry struct{}
 
 func (alwaysFailRegistry) Register(tools.BaseTool) {}
 
+func (alwaysFailRegistry) Use(tools.MiddlewareFunc) {}
+
 func (alwaysFailRegistry) GetAvailableTools() []schema.ToolDefinition {
 	return []schema.ToolDefinition{{Name: "read_file"}}
 }
