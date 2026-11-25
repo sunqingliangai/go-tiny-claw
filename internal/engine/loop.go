@@ -43,6 +43,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	composer := ctxpkg.NewPromptComposer(session.WorkDir, planMode, taskDir)
 	systemMsg := composer.Build()
 
+	// 循环检测状态只属于本次 Agent Run，避免共享 Engine 的不同飞书聊天互相污染。
+	reminderInjector := NewReminderInjector(session.WorkDir)
+
 	turnCount := 0
 
 	for {
@@ -113,6 +116,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 		// 预分配切片以保证顺序并避免并发写入锁
 		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
+		toolResults := make([]schema.ToolResult, len(actionResp.ToolCalls))
 		var wg sync.WaitGroup
 
 		for i, toolCall := range actionResp.ToolCalls {
@@ -161,14 +165,48 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 					Content:    finalOutput,
 					ToolCallID: call.ID,
 				}
+				toolResults[idx] = result
 			}(i, toolCall)
 		}
 
 		wg.Wait() // 阻塞聚合
 		log.Println("[Engine] 所有并发工具执行完毕，开始聚合观察结果 (Observation)...")
 
+		// 【核心防线】按模型原始调用顺序观察整批结果，避免教学快照只检查第 1 个工具的缺陷。
+		var loopErr *LoopLimitError
+		for i, call := range actionResp.ToolCalls {
+			decision := reminderInjector.Observe(call, toolResults[i])
+			if decision.Note != "" {
+				// 提醒附在对应 ToolResult 后，保留 ToolCallID 与结果来源。
+				observationMsgs[i].Content += "\n\n" + decision.Note
+				log.Printf(
+					"[Reminder] 工具 %s 连续 %d 次相同失败，已注入改策略提醒\n",
+					call.Name,
+					decision.Count,
+				)
+			}
+			if decision.Stop != nil {
+				loopErr = decision.Stop
+				break
+			}
+		}
+
 		// 将全部工具执行结果追加到 Session，开启下一轮复盘与推理。
 		session.Append(observationMsgs...)
+
+		if loopErr != nil {
+			// 受控停止也要留下最终 Assistant 消息，避免 Session 以 ToolResult 悬空结束。
+			stopMessage := loopErr.Error()
+			session.Append(schema.Message{
+				Role:    schema.RoleAssistant,
+				Content: stopMessage,
+			})
+			if reporter != nil {
+				reporter.OnMessage(ctx, stopMessage)
+			}
+			log.Printf("[Reminder] ⚠️ 检测到死循环，Agent 已受控停止: %v\n", loopErr)
+			return loopErr
+		}
 	}
 
 	return nil

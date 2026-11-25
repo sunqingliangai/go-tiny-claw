@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -265,6 +266,19 @@ func (b *Bot) handleAgentTask(parent context.Context, task inboundMessage) {
 
 	// Run 会阻塞到本轮 ReAct 结束；单 Worker 因此天然保证同一时刻只有一个 Agent Run。
 	if err := b.engine.Run(ctx, session, reporter); err != nil {
+		var loopErr *engine.LoopLimitError
+		if errors.As(err, &loopErr) {
+			// Engine 已把明确的停止原因写入 Session，并通过 Reporter 回复用户。
+			// 这里只记录受控终止，不再追加一层通用的“运行失败”消息。
+			log.Printf(
+				"[Feishu] 检测到连续失败循环，Agent 已受控停止 message_id=%s tool=%s count=%d",
+				task.MessageID,
+				loopErr.ToolName,
+				loopErr.Count,
+			)
+			return
+		}
+
 		log.Printf("[Feishu] Agent 运行失败 message_id=%s: %v", task.MessageID, err)
 		// 父 Context 已取消时不再尝试发送错误消息，避免进程退出阶段产生无意义网络请求。
 		if parent.Err() == nil {
