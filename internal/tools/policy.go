@@ -57,6 +57,10 @@ func NewDefaultPolicy(workDir string) MiddlewareFunc {
 				Reason: "Bash 命令拥有宿主机文件、进程和网络权限，需要人工审批。",
 			}, nil
 
+		case "spawn_subagent":
+			// 子 Agent 使用独立 Registry；委派本身不直接产生写副作用。
+			return MiddlewareDecision{Effect: PolicyAllow}, nil
+
 		default:
 			return MiddlewareDecision{
 				Effect: PolicyAsk,

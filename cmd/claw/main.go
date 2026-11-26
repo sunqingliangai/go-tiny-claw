@@ -31,6 +31,13 @@ func main() {
 	// 使用 OpenAI 兼容协议连接真实的智谱模型。
 	// 如需体验 Claude 兼容协议，只需替换为 provider.NewZhipuClaudeProvider。
 	llmProvider := provider.NewZhipuOpenAIProvider("glm-4.5-air")
+
+	// 为子智能体准备课程同款探索工具集。
+	// 为保持第 17 讲代码简单，该 Registry 不挂审批 Middleware；Bash 仍拥有宿主机权限，仅适合教学演示。
+	exploreRegistry := tools.NewRegistry()
+	exploreRegistry.Register(tools.NewReadFileTool(workDir))
+	exploreRegistry.Register(tools.NewBashTool(workDir))
+
 	registry := tools.NewRegistry()
 
 	// 挂载极简工具集
@@ -44,6 +51,9 @@ func main() {
 
 	// 开启慢思考
 	eng := engine.NewAgentEngine(llmProvider, registry, false)
+
+	// Subagent 对主 Agent 暴露为普通工具；子 Registry 刻意不包含 spawn_subagent，避免递归委派。
+	registry.Register(tools.NewSubagentTool(eng, exploreRegistry))
 
 	bot, err := feishu.NewBot(eng, feishu.Config{
 		AppID:       os.Getenv("FEISHU_APP_ID"),

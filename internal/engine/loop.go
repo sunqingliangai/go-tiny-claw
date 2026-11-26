@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	ctxpkg "github.com/sunqingliangai/go-tiny-claw/internal/context"
@@ -210,6 +211,81 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	}
 
 	return nil
+}
+
+// RunSub 是一次性的受限探索循环。
+// 与课程一致，它不依赖父 Session，结束后只返回文本摘要。
+func (e *AgentEngine) RunSub(
+	ctx context.Context,
+	taskPrompt string,
+	subRegistry tools.Registry,
+) (string, error) {
+	contextHistory := []schema.Message{
+		{
+			Role: schema.RoleSystem,
+			Content: `你是一个专门负责深度探索的探路者 (Explorer Subagent)。
+你的任务是根据主架构师的指令，在当前工作区内仔细阅读代码、查阅日志，搜集足够的信息。
+
+核心纪律：
+1. 必须依靠工具寻找答案，不允许凭空捏造或猜测。
+2. 如果没有找到确切答案，继续使用工具深入搜索。
+3. 找到足够线索后停止调用工具，直接输出纯文本汇报。`,
+		},
+		{
+			Role:    schema.RoleUser,
+			Content: taskPrompt,
+		},
+	}
+
+	const maxSubTurns = 10
+	for turn := 1; turn <= maxSubTurns; turn++ {
+		availableTools := subRegistry.GetAvailableTools()
+		compactedContext := e.compactor.Compact(contextHistory)
+
+		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
+		if err != nil {
+			return "", fmt.Errorf("子智能体推理失败: %w", err)
+		}
+		contextHistory = append(contextHistory, *actionResp)
+
+		if len(actionResp.ToolCalls) == 0 {
+			summary := strings.TrimSpace(actionResp.Content)
+			if summary == "" {
+				return "", fmt.Errorf("子智能体没有输出摘要")
+			}
+			return summary, nil
+		}
+
+		log.Printf("[Subagent] Turn %d 并发调用 %d 个工具", turn, len(actionResp.ToolCalls))
+		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
+		var wg sync.WaitGroup
+
+		for i, toolCall := range actionResp.ToolCalls {
+			wg.Add(1)
+			go func(idx int, call schema.ToolCall) {
+				defer wg.Done()
+
+				log.Printf("  -> [Subagent-%d] 执行工具: %s", idx, call.Name)
+				result := subRegistry.Execute(ctx, call)
+
+				finalOutput := result.Output
+				if result.IsError {
+					finalOutput = e.recovery.AnalyzeAndInject(call.Name, result)
+				}
+
+				observationMsgs[idx] = schema.Message{
+					Role:       schema.RoleUser,
+					Content:    finalOutput,
+					ToolCallID: call.ID,
+				}
+			}(i, toolCall)
+		}
+
+		wg.Wait()
+		contextHistory = append(contextHistory, observationMsgs...)
+	}
+
+	return "", fmt.Errorf("子智能体超过 %d 轮，已被强制召回", maxSubTurns)
 }
 
 func previewForReporter(content string, limit int) string {

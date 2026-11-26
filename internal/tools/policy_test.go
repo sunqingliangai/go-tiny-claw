@@ -24,6 +24,21 @@ func TestDefaultPolicyRequiresApprovalForBash(t *testing.T) {
 	}
 }
 
+func TestDefaultPolicyAllowsSubagentSpawn(t *testing.T) {
+	policy := NewDefaultPolicy(t.TempDir())
+	decision, err := policy(context.Background(), schema.ToolCall{
+		Name:      "spawn_subagent",
+		Arguments: json.RawMessage(`{"task_prompt":"探索代码"}`),
+	})
+
+	if err != nil {
+		t.Fatalf("policy failed: %v", err)
+	}
+	if decision.Effect != PolicyAllow {
+		t.Fatalf("subagent spawn should be allowed, got %s", decision.Effect)
+	}
+}
+
 func TestDefaultPolicyAllowsFilesInsideWorkspace(t *testing.T) {
 	workDir := t.TempDir()
 	policy := NewDefaultPolicy(workDir)
